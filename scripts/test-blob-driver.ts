@@ -8,6 +8,7 @@ import { storageKind } from "../src/lib/storage/driver"
 import {
   contactNotesPathname,
   createBlobPhotoStorage,
+  isMissingBlob,
   publicBlobReadUrl,
   vercelBlobClient,
   type BlobClient,
@@ -27,6 +28,21 @@ type Stored = {
   pathname: string
 }
 
+function objectPath(pathname: string) {
+  const withoutQuery = pathname.split("?")[0] ?? pathname
+  if (!withoutQuery.includes("://")) return withoutQuery.replace(/^\/+/, "")
+  return new URL(withoutQuery).pathname.replace(/^\/+/, "")
+}
+
+function assertNoPrivateCacheParam(pathname: string) {
+  const query = pathname.includes("?") ? pathname.slice(pathname.indexOf("?") + 1) : ""
+  if (new URLSearchParams(query).get("cache") === "0") {
+    throw new Error(
+      "Vercel Blob: Failed to fetch blob: 400 Bad Request: cache=0 is only available for private stores",
+    )
+  }
+}
+
 function memoryClient() {
   const store = new Map<string, Stored>()
   let revision = 0
@@ -36,6 +52,10 @@ function memoryClient() {
       if (options.access === "private") {
         throw new Error("Vercel Blob: Failed to fetch blob: 400 Bad Request")
       }
+      if (options.cacheControlMaxAge !== undefined && options.cacheControlMaxAge < 60) {
+        throw new Error("Vercel Blob: cacheControlMaxAge cannot be lower than 1 minute on a public store")
+      }
+      assertNoPrivateCacheParam(pathname)
       const existing = store.get(pathname)
       if (options.ifMatch) {
         if (!existing || existing.etag !== options.ifMatch) {
@@ -68,7 +88,8 @@ function memoryClient() {
       if (options.access === "private") {
         throw new Error("Vercel Blob: Failed to fetch blob: 400 Bad Request")
       }
-      const item = store.get(pathname)
+      assertNoPrivateCacheParam(pathname)
+      const item = store.get(objectPath(pathname))
       if (!item || item.access !== options.access) return null
       const bytes = item.body
       return {
@@ -134,12 +155,80 @@ test("seed files are present and sharp can read one", async () => {
   assert.ok(webp.byteLength > 100)
 })
 
-test("public blob reads bypass the CDN cache", () => {
+test("public blob reads avoid the private cache=0 parameter", async () => {
+  const url = publicBlobReadUrl("library.json", "vercel_blob_rw_store123_secret", "fresh")
   assert.equal(
-    publicBlobReadUrl("library.json", "vercel_blob_rw_store123_secret"),
-    "https://store123.public.blob.vercel-storage.com/library.json?cache=0",
+    url,
+    "https://store123.public.blob.vercel-storage.com/library.json?v=fresh",
   )
-  assert.equal(publicBlobReadUrl("https://example.com/library.json", "vercel_blob_rw_store123_secret"), "https://example.com/library.json")
+  assert.equal(url.includes("cache=0"), false)
+  assert.equal(
+    publicBlobReadUrl("https://example.com/library.json", "vercel_blob_rw_store123_secret", "fresh"),
+    "https://example.com/library.json",
+  )
+
+  const { client, store } = memoryClient()
+  await client.put("library.json", "{}", {
+    access: "public",
+    contentType: "application/json",
+    allowOverwrite: false,
+    cacheControlMaxAge: 60,
+  })
+  const hit = await client.get(url, { access: "public", useCache: false })
+  assert.equal(hit?.statusCode, 200)
+  assert.equal(store.has("library.json"), true)
+  const missing = await client.get(
+    publicBlobReadUrl("notes/missing.json", "vercel_blob_rw_store123_secret", "fresh"),
+    { access: "public", useCache: false },
+  )
+  assert.equal(missing, null)
+  await assert.rejects(
+    () =>
+      client.get(
+        "https://store123.public.blob.vercel-storage.com/library.json?cache=0",
+        { access: "public", useCache: false },
+      ),
+    /cache=0 is only available for private stores/,
+  )
+})
+
+test("a 404 from the blob store is a missing library", () => {
+  const error = new Error("Vercel Blob: Failed to fetch blob: 404 Not Found")
+  assert.equal(isMissingBlob(error), true)
+  assert.equal(isMissingBlob(new Error("Blob not found")), true)
+  assert.equal(isMissingBlob(new Error("Vercel Blob: Failed to fetch blob: 400 Bad Request")), false)
+})
+
+test("seeding runs when the first public read is a 404", async () => {
+  const { client, store } = memoryClient()
+  let reads = 0
+  const storage = createBlobPhotoStorage({
+    client: {
+      put: (pathname, body, options) => client.put(pathname, body, options),
+      del: (pathnames) => client.del(pathnames),
+      async get(pathname, options) {
+        reads += 1
+        if (reads === 1) {
+          throw new Error("Vercel Blob: Failed to fetch blob: 404 Not Found")
+        }
+        return client.get(pathname, options)
+      },
+    },
+    notesSecret: () => "memory-store-secret",
+    readSeed: async () => ({ albums: [], photos: [] }),
+    processImage: async () => {
+      throw new Error("seed has no photographs")
+    },
+  })
+
+  assert.deepEqual(await storage.listPhotos(), [])
+  assert.equal(store.has("library.json"), true)
+  const catalog = JSON.parse(store.get("library.json")!.body.toString("utf8")) as {
+    photos: unknown[]
+    messages: unknown[]
+  }
+  assert.deepEqual(catalog.photos, [])
+  assert.deepEqual(catalog.messages, [])
 })
 
 test("contact notes pathname is an unguessable hash of the blob token", () => {

@@ -21,6 +21,7 @@ import type {
 
 const CATALOG_PATH = "library.json"
 const LIBRARY_LIMIT = 2 * 1024 * 1024
+const MINUTE_SECONDS = 60
 const YEAR_SECONDS = 60 * 60 * 24 * 365
 const NOTES_SALT = "photography-portfolio:contact-notes:v1:"
 
@@ -44,19 +45,28 @@ function notesSecret() {
 }
 
 /**
- * `get({ access: "public", useCache: false })` does not bypass the CDN.
- * The private client appends `cache=0`; do the same for public reads of
- * JSON that conditional writes depend on.
+ * Public stores answer `?cache=0` with 400 ("cache=0 is only available for
+ * private stores"). A unique `v` query is accepted and misses the CDN entry
+ * for the bare pathname, so catalog reads see a fresh 404 or the latest JSON.
  */
-export function publicBlobReadUrl(pathname: string, token: string) {
+export function publicBlobReadUrl(
+  pathname: string,
+  token: string,
+  nonce: string = randomUUID(),
+) {
   if (pathname.includes("://")) return pathname
   const storeId = token.split("_")[3] ?? ""
   if (!storeId) return pathname
   const url = new URL(
     `https://${storeId}.public.blob.vercel-storage.com/${pathname}`,
   )
-  url.searchParams.set("cache", "0")
+  url.searchParams.set("v", nonce)
   return url.toString()
+}
+
+export function isMissingBlob(error: unknown) {
+  if (!(error instanceof Error)) return false
+  return /\b404\b/.test(error.message) || /blob not found/i.test(error.message)
 }
 
 export type ProcessedImage = {
@@ -128,13 +138,12 @@ export const vercelBlobClient: BlobClient = {
   async get(pathname, options) {
     requireToken()
     const token = process.env.BLOB_READ_WRITE_TOKEN?.trim() ?? ""
-    const target =
-      options.access === "public" && options.useCache !== true
-        ? publicBlobReadUrl(pathname, token)
-        : pathname
+    const freshPublic = options.access === "public" && options.useCache !== true
+    const target = freshPublic ? publicBlobReadUrl(pathname, token) : pathname
     const result = await blobGet(target, {
       access: options.access,
-      useCache: options.useCache ?? false,
+      // useCache:false appends cache=0, which public stores reject.
+      useCache: options.access === "public" ? true : options.useCache,
     })
     if (!result) return null
     return {
@@ -278,11 +287,21 @@ export function createBlobPhotoStorage(deps: {
     })
   }
 
+  async function readPublic(pathname: string) {
+    try {
+      return await client.get(pathname, {
+        access: "public",
+        useCache: false,
+      })
+    } catch (error) {
+      // Public stores return 404 until the object exists. Callers treat that as empty.
+      if (isMissingBlob(error)) return null
+      throw error
+    }
+  }
+
   async function readCatalog(): Promise<{ library: Library; etag: string } | null> {
-    const result = await client.get(CATALOG_PATH, {
-      access: "public",
-      useCache: false,
-    })
+    const result = await readPublic(CATALOG_PATH)
     if (!result || result.statusCode !== 200 || !result.stream) return null
     const raw = (
       await readStream(
@@ -305,7 +324,7 @@ export function createBlobPhotoStorage(deps: {
       contentType: "application/json",
       allowOverwrite: options.allowOverwrite,
       addRandomSuffix: false,
-      cacheControlMaxAge: 0,
+      cacheControlMaxAge: MINUTE_SECONDS,
       ifMatch: options.ifMatch,
     })
   }
@@ -327,10 +346,7 @@ export function createBlobPhotoStorage(deps: {
     messages: ContactMessage[]
     etag: string
   } | null> {
-    const result = await client.get(contactNotesPathname(secretForNotes()), {
-      access: "public",
-      useCache: false,
-    })
+    const result = await readPublic(contactNotesPathname(secretForNotes()))
     if (!result || result.statusCode !== 200 || !result.stream) return null
     const raw = (
       await readStream(
@@ -354,7 +370,7 @@ export function createBlobPhotoStorage(deps: {
         contentType: "application/json",
         allowOverwrite: options.allowOverwrite,
         addRandomSuffix: false,
-        cacheControlMaxAge: 0,
+        cacheControlMaxAge: MINUTE_SECONDS,
         ifMatch: options.ifMatch,
       },
     )
@@ -526,10 +542,7 @@ export function createBlobPhotoStorage(deps: {
 
       try {
         if (incoming) {
-          const downloaded = await client.get(incoming, {
-            access: "public",
-            useCache: false,
-          })
+          const downloaded = await readPublic(incoming)
           if (!downloaded || downloaded.statusCode !== 200 || !downloaded.stream) {
             throw new StorageError("That upload could not be found.")
           }
