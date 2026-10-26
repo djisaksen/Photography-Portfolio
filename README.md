@@ -63,9 +63,10 @@ This driver needs a persistent disk. Use it for `npm run dev` and for a long-run
 `src/lib/storage/blob.ts` uses `@vercel/blob` and `BLOB_READ_WRITE_TOKEN`.
 
 - Photographs are public WebP objects at `photos/{id}/full.webp` and `thumb.webp`. `/api/media` redirects to those URLs, so a large image is not streamed through the function body limit.
-- The library (photographs, albums, and contact notes) is a private object at `library.json`. Notes are not world-readable.
+- The catalog (photographs and albums) is a public object at `library.json`. A public Blob store rejects private reads and writes, so this file has to be public. Its `messages` array is always empty.
+- Contact notes are a separate public object at `notes/<sha256>.json`. The hash is `SHA-256` of a fixed salt plus `BLOB_READ_WRITE_TOKEN`, so the pathname is not guessable and is not linked from the site. Rotating the token leaves old notes at the previous pathname; the studio will not list them.
 - The first request seeds from `content/seed` when `library.json` is absent, then uploads the derivatives. Later requests leave the store alone.
-- The studio uploads the original from the browser with `@vercel/blob/client` to a private `incoming/…` object (multipart above 4 MB). Vercel’s request body limit is about 4.5 MB, so the file never passes through the function. The server downloads it, builds the WebP sizes, writes the library, and deletes the original.
+- The studio uploads the original from the browser with `@vercel/blob/client` to a public `incoming/…` object with a random suffix (multipart above 4 MB). Vercel’s request body limit is about 4.5 MB, so the file never passes through the function. The server downloads it, builds the WebP sizes, writes the catalog, and deletes the original.
 
 `src/lib/storage/cloud.ts` remains a stub for any other bucket. `STORAGE_DRIVER=s3` or `cloud` returns that stub.
 
@@ -84,7 +85,7 @@ This driver needs a persistent disk. Use it for `npm run dev` and for a long-run
 
 Do not set `STORAGE_DIR` on Vercel. Leave `BLOB_READ_WRITE_TOKEN` empty for local disk development.
 
-4. Open the deployment once. That first request creates the private library and uploads the seed photographs. After that, sign in at `/upload` and add photographs there.
+4. Open the deployment once. That first request creates the public catalog and uploads the seed photographs. After that, sign in at `/upload` and add photographs there. A public Blob store is enough; private blob access is not used.
 
 `sharp` runs on Vercel’s Node runtime. Page and route functions allow 60 seconds so the first seed and a large upload can finish. New projects use Fluid Compute, which accepts that duration. The session cookie is `Secure` in production.
 

@@ -53,6 +53,7 @@ export async function POST(request: Request) {
           maximumSizeInBytes: MAX_UPLOAD_BYTES,
           addRandomSuffix: true,
           allowOverwrite: false,
+          cacheControlMaxAge: 0,
         }
       },
     })

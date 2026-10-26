@@ -6,7 +6,9 @@ import sharp from "sharp"
 
 import { storageKind } from "../src/lib/storage/driver"
 import {
+  contactNotesPathname,
   createBlobPhotoStorage,
+  publicBlobReadUrl,
   vercelBlobClient,
   type BlobClient,
   type BlobGetResult,
@@ -31,6 +33,9 @@ function memoryClient() {
 
   const client: BlobClient = {
     async put(pathname, body, options: BlobPutOptions): Promise<BlobObject> {
+      if (options.access === "private") {
+        throw new Error("Vercel Blob: Failed to fetch blob: 400 Bad Request")
+      }
       const existing = store.get(pathname)
       if (options.ifMatch) {
         if (!existing || existing.etag !== options.ifMatch) {
@@ -41,10 +46,7 @@ function memoryClient() {
       }
       revision += 1
       const etag = `W/"${revision}"`
-      const host =
-        options.access === "private"
-          ? "memory.private.blob.vercel-storage.com"
-          : "memory.public.blob.vercel-storage.com"
+      const host = "memory.public.blob.vercel-storage.com"
       const stored: Stored = {
         body: Buffer.isBuffer(body) ? Buffer.from(body) : Buffer.from(body),
         access: options.access,
@@ -63,6 +65,9 @@ function memoryClient() {
     },
 
     async get(pathname, options): Promise<BlobGetResult | null> {
+      if (options.access === "private") {
+        throw new Error("Vercel Blob: Failed to fetch blob: 400 Bad Request")
+      }
       const item = store.get(pathname)
       if (!item || item.access !== options.access) return null
       const bytes = item.body
@@ -107,7 +112,7 @@ test("vercel blob client refuses to call the network without a token", async () 
   delete process.env.BLOB_READ_WRITE_TOKEN
   try {
     await assert.rejects(
-      () => vercelBlobClient.put("library.json", "{}", { access: "private" }),
+      () => vercelBlobClient.put("library.json", "{}", { access: "public" }),
       (error: unknown) => {
         assert.ok(error instanceof StorageError)
         assert.match(error.message, /BLOB_READ_WRITE_TOKEN/)
@@ -129,11 +134,31 @@ test("seed files are present and sharp can read one", async () => {
   assert.ok(webp.byteLength > 100)
 })
 
+test("public blob reads bypass the CDN cache", () => {
+  assert.equal(
+    publicBlobReadUrl("library.json", "vercel_blob_rw_store123_secret"),
+    "https://store123.public.blob.vercel-storage.com/library.json?cache=0",
+  )
+  assert.equal(publicBlobReadUrl("https://example.com/library.json", "vercel_blob_rw_store123_secret"), "https://example.com/library.json")
+})
+
+test("contact notes pathname is an unguessable hash of the blob token", () => {
+  const secret = "vercel_blob_rw_store123_supersecret"
+  const pathname = contactNotesPathname(secret)
+  assert.match(pathname, /^notes\/[a-f0-9]{64}\.json$/)
+  assert.equal(pathname.includes("supersecret"), false)
+  assert.equal(pathname.includes("store123"), false)
+  assert.equal(pathname, contactNotesPathname(secret))
+  assert.notEqual(pathname, contactNotesPathname(`${secret}x`))
+})
+
 test("blob driver seeds, edits, and deletes against an in-memory store", async () => {
   const { client, store } = memoryClient()
   let seedReads = 0
+  const notesSecret = () => "memory-store-secret"
   const storage = createBlobPhotoStorage({
     client,
+    notesSecret,
     readSeed: async () => {
       seedReads += 1
       return {
@@ -168,7 +193,11 @@ test("blob driver seeds, edits, and deletes against an in-memory store", async (
 
   const library = store.get("library.json")
   assert.ok(library)
-  assert.equal(library.access, "private")
+  assert.equal(library.access, "public")
+  const catalog = JSON.parse(library.body.toString("utf8")) as {
+    messages: unknown[]
+  }
+  assert.deepEqual(catalog.messages, [])
   assert.match(library.body.toString("utf8"), /Harbor, late/)
 
   const image = [...store.values()].find((item) => item.pathname.endsWith("/full.webp"))
@@ -184,6 +213,7 @@ test("blob driver seeds, edits, and deletes against an in-memory store", async (
 
   const again = createBlobPhotoStorage({
     client,
+    notesSecret,
     readSeed: async () => {
       seedReads += 1
       return null
@@ -208,7 +238,7 @@ test("blob driver seeds, edits, and deletes against an in-memory store", async (
   assert.equal((await storage.listPhotos())[0]?.title, "After the rain")
 
   await client.put("incoming/road.jpg", Buffer.from("from-browser"), {
-    access: "private",
+    access: "public",
     contentType: "image/jpeg",
     allowOverwrite: false,
   })
@@ -251,4 +281,25 @@ test("blob driver seeds, edits, and deletes against an in-memory store", async (
   )
   assert.equal(store.has(`photos/${fromBrowser.id}/full.webp`), false)
   assert.equal(store.has(`photos/${fromBrowser.id}/thumb.webp`), false)
+
+  const note = await storage.saveMessage({
+    name: "Ada",
+    email: "ada@example.com",
+    message: "Hello from the coast.",
+  })
+  assert.equal(note.email, "ada@example.com")
+  const notesPath = contactNotesPathname(notesSecret())
+  const notes = store.get(notesPath)
+  assert.ok(notes)
+  assert.equal(notes.access, "public")
+  assert.match(notes.body.toString("utf8"), /ada@example.com/)
+  const catalogAfter = JSON.parse(store.get("library.json")!.body.toString("utf8")) as {
+    messages: unknown[]
+  }
+  assert.deepEqual(catalogAfter.messages, [])
+  assert.equal(store.get("library.json")!.body.toString("utf8").includes("ada@example.com"), false)
+  assert.equal((await storage.listMessages())[0]?.email, "ada@example.com")
+
+  await storage.deletePhoto(added.id)
+  assert.equal((await storage.listMessages())[0]?.id, note.id)
 })

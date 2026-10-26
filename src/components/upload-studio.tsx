@@ -43,7 +43,7 @@ async function uploadToBlob(
 ) {
   const mime = detectMime(item.file.name, item.file.type)
   const blob = await upload(incomingPathname(item.file.name), item.file, {
-    access: "private",
+    access: "public",
     handleUploadUrl: "/api/blob/upload",
     contentType: mime ?? undefined,
     multipart: item.file.size > 4 * 1024 * 1024,

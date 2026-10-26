@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
 
 import {
   BlobPreconditionFailedError,
@@ -19,9 +19,45 @@ import type {
   SavePhotoInput,
 } from "./types"
 
-const LIBRARY_PATH = "library.json"
+const CATALOG_PATH = "library.json"
 const LIBRARY_LIMIT = 2 * 1024 * 1024
 const YEAR_SECONDS = 60 * 60 * 24 * 365
+const NOTES_SALT = "photography-portfolio:contact-notes:v1:"
+
+/**
+ * Public Blob stores reject `access: "private"` with 400. The catalog at
+ * `library.json` is therefore public and must not contain contact notes.
+ * Notes live at `notes/<sha256>.json`, which is unguessable without the
+ * read-write token. Rotating that token orphans existing notes.
+ */
+export function contactNotesPathname(secret: string) {
+  const digest = createHash("sha256").update(`${NOTES_SALT}${secret}`).digest("hex")
+  return `notes/${digest}.json`
+}
+
+function notesSecret() {
+  const secret = process.env.BLOB_READ_WRITE_TOKEN?.trim()
+  if (!secret) {
+    throw new StorageError(TOKEN_MESSAGE, 500)
+  }
+  return secret
+}
+
+/**
+ * `get({ access: "public", useCache: false })` does not bypass the CDN.
+ * The private client appends `cache=0`; do the same for public reads of
+ * JSON that conditional writes depend on.
+ */
+export function publicBlobReadUrl(pathname: string, token: string) {
+  if (pathname.includes("://")) return pathname
+  const storeId = token.split("_")[3] ?? ""
+  if (!storeId) return pathname
+  const url = new URL(
+    `https://${storeId}.public.blob.vercel-storage.com/${pathname}`,
+  )
+  url.searchParams.set("cache", "0")
+  return url.toString()
+}
 
 export type ProcessedImage = {
   full: Buffer
@@ -91,7 +127,12 @@ export const vercelBlobClient: BlobClient = {
 
   async get(pathname, options) {
     requireToken()
-    const result = await blobGet(pathname, {
+    const token = process.env.BLOB_READ_WRITE_TOKEN?.trim() ?? ""
+    const target =
+      options.access === "public" && options.useCache !== true
+        ? publicBlobReadUrl(pathname, token)
+        : pathname
+    const result = await blobGet(target, {
       access: options.access,
       useCache: options.useCache ?? false,
     })
@@ -213,8 +254,10 @@ export function createBlobPhotoStorage(deps: {
   client: BlobClient
   processImage: (bytes: Buffer) => Promise<ProcessedImage>
   readSeed: () => Promise<SeedContent | null>
+  notesSecret?: () => string
 }): PhotoStorage {
   const { client, processImage, readSeed } = deps
+  const secretForNotes = deps.notesSecret ?? notesSecret
   let queue: Promise<void> = Promise.resolve()
 
   function withLock<T>(fn: () => Promise<T>): Promise<T> {
@@ -226,9 +269,18 @@ export function createBlobPhotoStorage(deps: {
     return run
   }
 
-  async function readLibrary(): Promise<{ library: Library; etag: string } | null> {
-    const result = await client.get(LIBRARY_PATH, {
-      access: "private",
+  function catalogPayload(library: Library) {
+    return JSON.stringify({
+      version: 1 as const,
+      photos: library.photos,
+      albums: library.albums,
+      messages: [] as ContactMessage[],
+    })
+  }
+
+  async function readCatalog(): Promise<{ library: Library; etag: string } | null> {
+    const result = await client.get(CATALOG_PATH, {
+      access: "public",
       useCache: false,
     })
     if (!result || result.statusCode !== 200 || !result.stream) return null
@@ -239,21 +291,73 @@ export function createBlobPhotoStorage(deps: {
         "The photo library is too large to read.",
       )
     ).toString("utf8")
-    return { library: parseLibrary(raw), etag: result.etag }
+    const library = parseLibrary(raw)
+    library.messages = []
+    return { library, etag: result.etag }
   }
 
-  async function writeLibrary(
+  async function writeCatalog(
     library: Library,
     options: { allowOverwrite: boolean; ifMatch?: string },
   ) {
-    await client.put(LIBRARY_PATH, JSON.stringify(library), {
-      access: "private",
+    await client.put(CATALOG_PATH, catalogPayload(library), {
+      access: "public",
       contentType: "application/json",
       allowOverwrite: options.allowOverwrite,
       addRandomSuffix: false,
-      cacheControlMaxAge: 60,
+      cacheControlMaxAge: 0,
       ifMatch: options.ifMatch,
     })
+  }
+
+  function parseNotes(raw: string): ContactMessage[] {
+    let parsed: { version?: unknown; messages?: unknown }
+    try {
+      parsed = JSON.parse(raw) as { version?: unknown; messages?: unknown }
+    } catch {
+      throw new StorageError("Contact notes could not be read.", 500)
+    }
+    if (!parsed || parsed.version !== 1 || !Array.isArray(parsed.messages)) {
+      throw new StorageError("Contact notes could not be read.", 500)
+    }
+    return parsed.messages as ContactMessage[]
+  }
+
+  async function readNotes(): Promise<{
+    messages: ContactMessage[]
+    etag: string
+  } | null> {
+    const result = await client.get(contactNotesPathname(secretForNotes()), {
+      access: "public",
+      useCache: false,
+    })
+    if (!result || result.statusCode !== 200 || !result.stream) return null
+    const raw = (
+      await readStream(
+        result.stream,
+        LIBRARY_LIMIT,
+        "Contact notes are too large to read.",
+      )
+    ).toString("utf8")
+    return { messages: parseNotes(raw), etag: result.etag }
+  }
+
+  async function writeNotes(
+    messages: ContactMessage[],
+    options: { allowOverwrite: boolean; ifMatch?: string },
+  ) {
+    await client.put(
+      contactNotesPathname(secretForNotes()),
+      JSON.stringify({ version: 1, messages }),
+      {
+        access: "public",
+        contentType: "application/json",
+        allowOverwrite: options.allowOverwrite,
+        addRandomSuffix: false,
+        cacheControlMaxAge: 0,
+        ifMatch: options.ifMatch,
+      },
+    )
   }
 
   async function putVariant(id: string, variant: ImageVariant, bytes: Buffer) {
@@ -330,29 +434,30 @@ export function createBlobPhotoStorage(deps: {
   }
 
   async function ensureLibrary() {
-    const existing = await readLibrary()
+    const existing = await readCatalog()
     if (existing) return
     const seeded = await buildSeed()
     try {
-      await writeLibrary(seeded.library, { allowOverwrite: false })
+      await writeCatalog(seeded.library, { allowOverwrite: false })
     } catch (error) {
       if (!isConflict(error)) throw error
       await removePaths(seeded.uploaded).catch(() => undefined)
     }
   }
 
-  async function updateLibrary<T>(mutator: (library: Library) => Promise<T> | T) {
+  async function updateCatalog<T>(mutator: (library: Library) => Promise<T> | T) {
     await whenReady()
     return withLock(async () => {
       for (let attempt = 0; attempt < 4; attempt += 1) {
-        const current = await readLibrary()
+        const current = await readCatalog()
         if (!current) {
           throw new StorageError("The photo library could not be read.", 500)
         }
         const next = structuredClone(current.library)
+        next.messages = []
         const result = await mutator(next)
         try {
-          await writeLibrary(next, {
+          await writeCatalog(next, {
             allowOverwrite: true,
             ifMatch: current.etag,
           })
@@ -365,9 +470,32 @@ export function createBlobPhotoStorage(deps: {
     })
   }
 
+  async function updateNotes<T>(
+    mutator: (messages: ContactMessage[]) => Promise<T> | T,
+  ) {
+    await whenReady()
+    return withLock(async () => {
+      for (let attempt = 0; attempt < 4; attempt += 1) {
+        const current = await readNotes()
+        const next = structuredClone(current?.messages ?? [])
+        const result = await mutator(next)
+        try {
+          await writeNotes(next, {
+            allowOverwrite: Boolean(current),
+            ifMatch: current?.etag,
+          })
+          return result
+        } catch (error) {
+          if (!isConflict(error) || attempt === 3) throw error
+        }
+      }
+      throw new StorageError("The archive changed while saving. Try again.", 409)
+    })
+  }
+
   async function loadLibrary() {
     await whenReady()
-    const current = await readLibrary()
+    const current = await readCatalog()
     if (!current) {
       throw new StorageError("The photo library could not be read.", 500)
     }
@@ -399,7 +527,7 @@ export function createBlobPhotoStorage(deps: {
       try {
         if (incoming) {
           const downloaded = await client.get(incoming, {
-            access: "private",
+            access: "public",
             useCache: false,
           })
           if (!downloaded || downloaded.statusCode !== 200 || !downloaded.stream) {
@@ -447,7 +575,7 @@ export function createBlobPhotoStorage(deps: {
             thumbUrl: thumb.url,
             fullUrl: full.url,
           }
-          return await updateLibrary(async (library) => {
+          return await updateCatalog(async (library) => {
             if (
               photo.albumId &&
               !library.albums.some((album) => album.id === photo.albumId)
@@ -469,7 +597,7 @@ export function createBlobPhotoStorage(deps: {
     },
 
     async updatePhoto(id, patch: PhotoPatch) {
-      return updateLibrary(async (library) => {
+      return updateCatalog(async (library) => {
         const photo = library.photos.find((item) => item.id === id)
         if (!photo) {
           throw new StorageError("That photograph is no longer in the archive.", 404)
@@ -495,7 +623,7 @@ export function createBlobPhotoStorage(deps: {
 
     async deletePhoto(id) {
       let paths: string[] = []
-      await updateLibrary(async (library) => {
+      await updateCatalog(async (library) => {
         const photo = library.photos.find((item) => item.id === id)
         if (!photo) {
           throw new StorageError("That photograph is no longer in the archive.", 404)
@@ -529,7 +657,7 @@ export function createBlobPhotoStorage(deps: {
       const name = input.name.trim().slice(0, 60)
       if (!name) throw new StorageError("Give the album a name.")
       const description = input.description.trim().slice(0, 280)
-      return updateLibrary(async (library) => {
+      return updateCatalog(async (library) => {
         const album: Album = {
           id: randomUUID(),
           slug: uniqueSlug(name, library.albums),
@@ -543,7 +671,7 @@ export function createBlobPhotoStorage(deps: {
     },
 
     async deleteAlbum(id) {
-      await updateLibrary(async (library) => {
+      await updateCatalog(async (library) => {
         const exists = library.albums.some((album) => album.id === id)
         if (!exists) {
           throw new StorageError("That album is no longer in the archive.", 404)
@@ -556,8 +684,9 @@ export function createBlobPhotoStorage(deps: {
     },
 
     async listMessages() {
-      const library = await loadLibrary()
-      return byNewest(library.messages)
+      await whenReady()
+      const notes = await readNotes()
+      return byNewest(notes?.messages ?? [])
     },
 
     async saveMessage(input) {
@@ -571,9 +700,10 @@ export function createBlobPhotoStorage(deps: {
       if (!message.name || !message.email || !message.message) {
         throw new StorageError("Name, email, and a note are required.")
       }
-      return updateLibrary(async (library) => {
-        library.messages.push(message)
-        library.messages = byNewest(library.messages).slice(0, 200)
+      return updateNotes(async (messages) => {
+        messages.push(message)
+        const kept = byNewest(messages).slice(0, 200)
+        messages.splice(0, messages.length, ...kept)
         return message
       })
     },

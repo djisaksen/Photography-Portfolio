@@ -10,7 +10,7 @@ export type SavePhotoInput = {
   caption: string
   albumId: string | null
   /**
-   * Private blob pathname from a browser upload (`incoming/...`).
+   * Blob pathname from a browser upload (`incoming/...` plus a random suffix).
    * The blob driver reads and then deletes it. The local driver ignores it.
    */
   sourcePathname?: string
