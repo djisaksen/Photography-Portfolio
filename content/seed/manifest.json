@@ -1,0 +1,77 @@
+{
+  "albums": [
+    {
+      "slug": "coast",
+      "name": "Coast",
+      "description": "Harbors, rock, and the water between weather."
+    },
+    {
+      "slug": "interiors",
+      "name": "Interiors",
+      "description": "Rooms where the light has already chosen."
+    },
+    {
+      "slug": "weather",
+      "name": "Weather",
+      "description": "Roads, cloud, and the hour before the day decides."
+    }
+  ],
+  "photos": [
+    {
+      "file": "seed-harbor.jpg",
+      "title": "Harbor, late",
+      "caption": "A few windows still on. The water took the rest.",
+      "album": "coast",
+      "createdAt": "2026-10-20T12:00:00.000Z"
+    },
+    {
+      "file": "seed-flowers.jpg",
+      "title": "Dried, on the sill",
+      "caption": "What the summer left on the windowsill.",
+      "album": "interiors",
+      "createdAt": "2026-10-02T12:00:00.000Z"
+    },
+    {
+      "file": "seed-rocks.jpg",
+      "title": "Incoming",
+      "caption": "The sea arriving in small measures.",
+      "album": "coast",
+      "createdAt": "2026-09-11T12:00:00.000Z"
+    },
+    {
+      "file": "seed-window.jpg",
+      "title": "Rain on the glass",
+      "caption": "A cup left where the daylight was strongest.",
+      "album": "interiors",
+      "createdAt": "2026-08-18T12:00:00.000Z"
+    },
+    {
+      "file": "seed-road.jpg",
+      "title": "Into the cloud",
+      "caption": "The road ends where the weather begins.",
+      "album": "weather",
+      "createdAt": "2026-07-07T12:00:00.000Z"
+    },
+    {
+      "file": "seed-boathouse.jpg",
+      "title": "Boathouse",
+      "caption": "Wet stone and grey timber, after the rain had finished.",
+      "album": "coast",
+      "createdAt": "2026-06-02T12:00:00.000Z"
+    },
+    {
+      "file": "seed-interior.jpg",
+      "title": "North light",
+      "caption": "The curtain did the work. I only waited.",
+      "album": "interiors",
+      "createdAt": "2026-04-19T12:00:00.000Z"
+    },
+    {
+      "file": "seed-fjord.jpg",
+      "title": "Blue hour, the fjord",
+      "caption": "A still hour. The water kept the sky.",
+      "album": "weather",
+      "createdAt": "2026-02-08T12:00:00.000Z"
+    }
+  ]
+}
